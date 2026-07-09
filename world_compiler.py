@@ -62,7 +62,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -70,6 +70,7 @@ import organic_ai_core as core
 import kaleidoscope_group as kgroup
 import genetic_manifold as gmod
 import refinement_loop as refine
+import semantic_embedding as sem
 
 # Ordered by facet count. A supernode's shape family is a deterministic
 # function of how many latent axes its kaleidoscope invariant actually uses —
@@ -142,7 +143,7 @@ class WorldScene:
 @dataclass
 class CompilerConfig:
     seed: int = 0
-    embed_dim: int = 16
+    embed_dim: int = 16           # orthographic (hashed-trigram) channel width
     target_chunks: int = 110      # windowing is auto-tuned toward this count
     min_window: int = 24
     max_window: int = 96
@@ -153,6 +154,12 @@ class CompilerConfig:
     strain_resolution: float = 0.35
     refine_max_passes: int = 40
     refine_purify_rate: float = 0.5
+    # semantic (word co-occurrence) channel — see semantic_embedding.py.
+    # Set semantic_dim=0 to fall back to pure orthographic embedding.
+    semantic_dim: int = 12
+    semantic_weight: float = 1.6  # relative influence vs the trigram channel
+    semantic_min_count: int = 2
+    semantic_max_vocab: int = 600
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +209,45 @@ def _auto_window(text_len: int, cfg: CompilerConfig) -> Tuple[int, int]:
     return window, stride
 
 
+def _ingest(text: str, cfg: CompilerConfig,
+           semantic: Optional[sem.SemanticSpace] = None
+           ) -> Tuple[int, int, List[str], np.ndarray, sem.SemanticSpace]:
+    """Chunk text and embed each chunk as [orthographic trigram features |
+    semantic co-occurrence features] (see semantic_embedding.py for why both:
+    trigrams see spelling and survive OOV/typos with zero vocabulary;
+    co-occurrence sees topic and requires enough text to learn one).
+
+    If `semantic` is passed in already fit, chunks are embedded through it
+    unchanged rather than fitting a new one — this is how LiveWorld.feed()
+    keeps a running world in the same semantic coordinate system its founding
+    text established, exactly as it reuses the founding geometric manifold.
+    Returns (window, stride, snippets, data, semantic_space_used).
+    """
+    window, stride = _auto_window(len(text), cfg)
+    if len(text) < window + stride:
+        raise WorldCompilerError(
+            f"text too short ({len(text)} chars); need at least "
+            f"{window + stride} for a stable world")
+    starts = list(range(0, len(text) - window + 1, stride))
+    snippets = [text[s:s + window] for s in starts]
+    src = core.load_text(text, dim=cfg.embed_dim, window=window, stride=stride)
+    n = len(starts)
+    trigram = np.stack([src.observe(t) for t in range(n)])
+
+    if cfg.semantic_dim <= 0:
+        return window, stride, snippets, trigram, sem.SemanticSpace.empty()
+
+    space = semantic if semantic is not None else sem.SemanticSpace.fit(
+        text, dim=cfg.semantic_dim, min_count=cfg.semantic_min_count,
+        max_vocab=cfg.semantic_max_vocab)
+    if space.dim > 0:
+        sem_frames = np.stack([space.vector_for(s) for s in snippets]) * cfg.semantic_weight
+        data = np.concatenate([trigram, sem_frames], axis=1)
+    else:
+        data = trigram  # too little text to learn a semantic space; degrade gracefully
+    return window, stride, snippets, data, space
+
+
 def _shape_kind(rep: np.ndarray, group: kgroup.KaleidoscopeGroup) -> str:
     """Facet family from the PARTICIPATION RATIO of the DNA's kaleidoscope
     invariant spectrum: (Σx²)² / Σx⁴, the standard measure of how many axes
@@ -228,6 +274,50 @@ def _origin_hash(row: np.ndarray) -> str:
     return hashlib.blake2b(row.tobytes(), digest_size=8).hexdigest()
 
 
+def project_strains(strains: List["kgroup.Strain"], group: kgroup.KaleidoscopeGroup,
+                    label_for_member: Callable[[int], str]) -> List[WorldObject]:
+    """Strains (crystallized supernodes) -> 3D objects. Shared by the batch
+    compiler and world_live.LiveWorld so both project identically. Every
+    visual property is a deterministic function of something the engine
+    already computed (see module docstring, stage 4) — nothing here is
+    arbitrary, and nothing here mutates strains/group.
+
+    ``label_for_member(local_index)`` resolves a strain's first member
+    (an index into whatever code array the strains were formed from) to a
+    human-readable provenance string.
+    """
+    if not strains:
+        return []
+    reps = np.stack([s.representative for s in strains])
+    top = min(3, reps.shape[1])
+    axes = reps[:, :top]
+    mean = axes.mean(axis=0)
+    spread = axes.std(axis=0)
+    spread = np.where(spread < 1e-9, 1.0, spread)
+    normed = (axes - mean) / spread
+    if top < 3:
+        normed = np.pad(normed, ((0, 0), (0, 3 - top)))
+
+    objects: List[WorldObject] = []
+    for k, strain in enumerate(strains):
+        rep = strain.representative
+        pos = tuple(float(v) * 2.4 for v in normed[k])
+        hue = _stable_unit(np.round(rep, 6).tobytes()) * 360.0
+        sat = 0.45 + 0.35 * min(strain.mass * len(strains), 1.0)
+        lum = 0.42 + 0.16 * _stable_unit(strain.signature.tobytes() + b"l")
+        color = _hsl_to_rgb(hue, sat, lum)
+        shape = _shape_kind(rep, group)
+        scale = 0.35 + 1.65 * (strain.mass ** 0.5)
+        label = " ".join(label_for_member(strain.members[0]).split())
+        spin = _stable_unit(rep.tobytes() + b"spin") * 6.28318
+
+        objects.append(WorldObject(
+            id=f"motif-{k}", position=pos, scale=scale, color=color,
+            shape=shape, mass=float(strain.mass), members=len(strain.members),
+            label=label, spin_seed=spin))
+    return objects
+
+
 # ---------------------------------------------------------------------------
 # The compiler
 # ---------------------------------------------------------------------------
@@ -243,17 +333,8 @@ class WorldCompiler:
     def compile(self, text: str) -> WorldScene:
         cfg = self.cfg
         text = text.strip()
-        window, stride = _auto_window(len(text), cfg)
-        if len(text) < window + stride:
-            raise WorldCompilerError(
-                f"text too short to compile ({len(text)} chars); need at "
-                f"least {window + stride} for a stable world")
-
-        starts = list(range(0, len(text) - window + 1, stride))
-        snippets = [text[s:s + window] for s in starts]
-        src = core.load_text(text, dim=cfg.embed_dim, window=window, stride=stride)
-        n = len(starts)
-        data = np.stack([src.observe(t) for t in range(n)])
+        window, stride, snippets, data, space = _ingest(text, cfg)
+        n = len(snippets)
         origin_to_chunk = {_origin_hash(data[i]): i for i in range(n)}
 
         # --- LIVE: evolve the text's own DNA under the closed economy -----
@@ -293,39 +374,11 @@ class WorldCompiler:
             eng.codes, eng.group, resolution=cfg.strain_resolution)
 
         # --- PROJECT: strains -> 3D objects --------------------------------
-        reps = np.stack([s.representative for s in strains])
-        top = min(3, reps.shape[1])
-        axes = reps[:, :top]
-        mean = axes.mean(axis=0)
-        spread = axes.std(axis=0)
-        spread = np.where(spread < 1e-9, 1.0, spread)
-        normed = (axes - mean) / spread
-        if top < 3:
-            normed = np.pad(normed, ((0, 0), (0, 3 - top)))
-
-        objects: List[WorldObject] = []
-        for k, strain in enumerate(strains):
-            rep = strain.representative
-            pos = tuple(float(v) * 2.4 for v in normed[k])
-            hue = _stable_unit(np.round(rep, 6).tobytes()) * 360.0
-            sat = 0.45 + 0.35 * min(strain.mass * len(strains), 1.0)
-            lum = 0.42 + 0.16 * _stable_unit(strain.signature.tobytes() + b"l")
-            color = _hsl_to_rgb(hue, sat, lum)
-            shape = _shape_kind(rep, eng.group)
-            scale = 0.35 + 1.65 * (strain.mass ** 0.5)
-
-            member_idx = strain.members[0]
+        def label_for(member_idx: int) -> str:
             chunk_i = origin_to_chunk.get(evolved_origins[member_idx])
-            label = snippets[chunk_i] if chunk_i is not None else "(inherited motif)"
-            label = " ".join(label.split())
+            return snippets[chunk_i] if chunk_i is not None else "(inherited motif)"
 
-            spin = _stable_unit(rep.tobytes() + b"spin") * 6.28318
-
-            objects.append(WorldObject(
-                id=f"motif-{k}", position=pos, scale=scale, color=color,
-                shape=shape, mass=float(strain.mass), members=len(strain.members),
-                label=label, spin_seed=spin))
-
+        objects = project_strains(strains, eng.group, label_for)
         edges = self._build_edges(objects)
 
         bg_hue = _stable_unit(np.round(report.one_entity, 6).tobytes()) * 360.0
@@ -341,6 +394,8 @@ class WorldCompiler:
             "refine_converged": report.converged,
             "motifs": len(objects),
             "seed": cfg.seed,
+            "semantic_vocab": len(space.vocab),
+            "semantic_dim": space.dim,
         }
 
         fp = self._fingerprint(objects, edges, background)
