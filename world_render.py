@@ -90,10 +90,14 @@ def _page(scene_json: str, geometry_json: str, title: str) -> str:
   }}
   .title-panel .sub {{ font-size: 10px; letter-spacing: 0.06em; color: #9a97ad; text-transform: uppercase; }}
 
-  .stats-panel {{ top: 16px; right: 16px; font-size: 10.5px; color: #b9b6c9; min-width: 190px; }}
+  .stats-panel {{ top: 16px; right: 16px; font-size: 10.5px; color: #b9b6c9; min-width: 190px; font-variant-numeric: tabular-nums; }}
   .stats-panel .row {{ display: flex; justify-content: space-between; gap: 14px; padding: 2px 0; }}
   .stats-panel .row b {{ color: #e8e6f0; font-weight: 500; }}
   .stats-panel .fp {{ margin-top: 6px; font-size: 9px; color: #6f6c80; word-break: break-all; }}
+
+  @media (prefers-reduced-motion: reduce) {{
+    .label-panel {{ transition: none; }}
+  }}
 
   .label-panel {{
     bottom: 16px; left: 16px; max-width: min(70vw, 560px);
@@ -210,13 +214,14 @@ function shade(rgb, ndotl) {{
   return `rgb(${{Math.round(rgb[0]*255*k)}},${{Math.round(rgb[1]*255*k)}},${{Math.round(rgb[2]*255*k)}})`;
 }}
 
+const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)').matches;
 let t = 0;
 const screenCenters = [];
 
 function frame() {{
   requestAnimationFrame(frame);
-  t += 0.016;
-  if (autoRotate) cam.yaw += 0.0011;
+  t += REDUCED_MOTION ? 0 : 0.016;
+  if (autoRotate && !REDUCED_MOTION) cam.yaw += 0.0011;
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   const grad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W, H) * 0.75);
@@ -312,3 +317,13 @@ def build_html(scene_dict: dict) -> str:
     geometry_json = json.dumps(_POLYHEDRA, separators=(",", ":"))
     title = f"World Compiler — {scene_dict.get('title', 'untitled')}"
     return _page(scene_json, geometry_json, title)
+
+
+def build_html_fragment(scene_dict: dict) -> str:
+    """Same page, with the outer <!doctype>/<html>/<head>/<body> wrapper
+    stripped — for embedding inside a host that supplies its own document
+    skeleton (e.g. the Artifact viewer)."""
+    full = build_html(scene_dict)
+    start = full.index('<meta charset="utf-8">')
+    end = full.rindex("</script>") + len("</script>")
+    return full[start:end]
