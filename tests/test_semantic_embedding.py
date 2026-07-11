@@ -14,3 +14,12 @@ def test_semantic_determinism():
     """Fitting the same text twice must produce byte-identical spaces."""
     text = "the quick brown fox jumps over the lazy dog " * 20
     sem.gate_determinism(text, dim=12)
+
+
+def test_pretrained_clustering_when_available():
+    """When sentence-transformers is installed the combined channel must
+    cluster at least as well as PPMI alone (margin=0.0).  Skipped when
+    sentence-transformers is absent."""
+    pytest.importorskip("sentence_transformers")
+    gap = sem.gate_pretrained_improvement(margin=0.0)
+    assert gap >= 0.0, f"pretrained combined gap unexpectedly negative: {gap:.3f}"

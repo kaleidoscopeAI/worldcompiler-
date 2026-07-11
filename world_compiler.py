@@ -75,7 +75,42 @@ import semantic_embedding as sem
 # Ordered by facet count. A supernode's shape family is a deterministic
 # function of how many latent axes its kaleidoscope invariant actually uses —
 # not an arbitrary skin, a readout of real structure (see _shape_kind).
+# When the motif's label text matches a semantic category keyword set,
+# the category shape overrides the participation-ratio selection below.
 _SHAPE_FAMILIES: Tuple[str, ...] = ("tetra", "cube", "octa", "icosa")
+
+# ---------------------------------------------------------------------------
+# Semantic shape vocabulary — keyword sets for each category shape
+# ---------------------------------------------------------------------------
+# Each key is a shape name present in world_render._POLYHEDRA.  The value is
+# a set of content tokens (stop-words already stripped) that signal that
+# category.  _semantic_shape_category returns the shape whose keyword set has
+# the most token overlap with the motif label; ties favour the order below.
+_SHAPE_KEYWORDS: Dict[str, frozenset] = {
+    "sphere": frozenset([
+        "person", "people", "human", "man", "woman", "child", "agent", "actor",
+        "character", "user", "individual", "mind", "brain", "life", "soul",
+        "creature", "animal", "organism", "body", "self", "identity", "emotion",
+        "feeling", "consciousness", "awareness", "intelligence", "ai",
+    ]),
+    "cube": frozenset([
+        "place", "location", "city", "town", "building", "room", "house",
+        "space", "world", "earth", "land", "region", "area", "country",
+        "domain", "environment", "structure", "architecture", "ground",
+        "floor", "wall", "boundary", "container", "system", "framework",
+    ]),
+    "cylinder": frozenset([
+        "process", "flow", "pipeline", "stream", "sequence", "chain",
+        "cycle", "loop", "iteration", "repeat", "rhythm", "pulse",
+        "column", "pillar", "tube", "pipe", "channel", "path", "track",
+    ]),
+    "cone": frozenset([
+        "action", "event", "change", "movement", "direction", "goal",
+        "progress", "advance", "growth", "development", "emergence",
+        "start", "launch", "rise", "transition", "moment", "peak",
+        "apex", "focus", "vector", "force", "dynamic",
+    ]),
+}
 
 
 class WorldCompilerError(core.OrganicError):
@@ -160,6 +195,9 @@ class CompilerConfig:
     semantic_weight: float = 1.6  # relative influence vs the trigram channel
     semantic_min_count: int = 2
     semantic_max_vocab: int = 600
+    # pretrained channel — requires sentence-transformers; falls back silently
+    # when the package is absent.  Set to 0 to disable.
+    pretrained_dim: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +277,9 @@ def _ingest(text: str, cfg: CompilerConfig,
 
     space = semantic if semantic is not None else sem.SemanticSpace.fit(
         text, dim=cfg.semantic_dim, min_count=cfg.semantic_min_count,
-        max_vocab=cfg.semantic_max_vocab)
-    if space.dim > 0:
+        max_vocab=cfg.semantic_max_vocab,
+        pretrained_dim=cfg.pretrained_dim)
+    if space.total_dim > 0:
         sem_frames = np.stack([space.vector_for(s) for s in snippets]) * cfg.semantic_weight
         data = np.concatenate([trigram, sem_frames], axis=1)
     else:
@@ -248,14 +287,44 @@ def _ingest(text: str, cfg: CompilerConfig,
     return window, stride, snippets, data, space
 
 
-def _shape_kind(rep: np.ndarray, group: kgroup.KaleidoscopeGroup) -> str:
-    """Facet family from the PARTICIPATION RATIO of the DNA's kaleidoscope
-    invariant spectrum: (Σx²)² / Σx⁴, the standard measure of how many axes
-    a vector effectively spreads across (1 for a single dominant axis, up to
-    the manifold rank for a uniform spread). A motif concentrated on one or
-    two latent axes renders as a simple tetrahedron; a motif whose identity is
-    smeared across most of the manifold renders as a many-faceted icosahedron.
-    Real structure, not a random skin."""
+def _semantic_shape_category(label: str) -> Optional[str]:
+    """Keyword-based semantic shape selection.  Tokenises the motif label and
+    counts matches against each shape's keyword set.  Returns the shape with
+    the highest overlap, or None when no keywords match.  Fully deterministic:
+    pure string matching, no RNG, no network."""
+    tokens = set(sem._content_tokens(label))
+    if not tokens:
+        return None
+    scores: Dict[str, int] = {
+        shape: len(tokens & kws)
+        for shape, kws in _SHAPE_KEYWORDS.items()
+    }
+    best_score = max(scores.values())
+    if best_score == 0:
+        return None
+    # Pick the highest-scoring shape; ties respect insertion order in _SHAPE_KEYWORDS.
+    return next(s for s, sc in scores.items() if sc == best_score)
+
+
+def _shape_kind(rep: np.ndarray, group: kgroup.KaleidoscopeGroup,
+                label: str = "") -> str:
+    """Facet family from two signals, applied in priority order:
+
+    1. **Semantic category** (highest priority): if the motif's label text
+       matches keywords for a named category (sphere/cube/cylinder/cone),
+       that shape is returned immediately.  This encodes *what kind of thing*
+       the motif represents rather than only *how complex* it is.
+
+    2. **Participation ratio** (fallback): (Σx²)² / Σx⁴ on the kaleidoscope
+       invariant spectrum — the standard measure of how many axes a vector
+       effectively spreads across.  A motif concentrated on one or two latent
+       axes renders as a simple tetrahedron; a motif whose identity is smeared
+       across most of the manifold renders as a many-faceted icosahedron.
+       Real structure, not a random skin."""
+    if label:
+        category = _semantic_shape_category(label)
+        if category is not None:
+            return category
     sig = group.invariant(rep)
     spectrum = sig[1:]
     sq = spectrum ** 2
@@ -306,9 +375,12 @@ def project_strains(strains: List["kgroup.Strain"], group: kgroup.KaleidoscopeGr
         sat = 0.45 + 0.35 * min(strain.mass * len(strains), 1.0)
         lum = 0.42 + 0.16 * _stable_unit(strain.signature.tobytes() + b"l")
         color = _hsl_to_rgb(hue, sat, lum)
-        shape = _shape_kind(rep, group)
-        scale = 0.35 + 1.65 * (strain.mass ** 0.5)
+        # Resolve the label first so _shape_kind can use it for semantic
+        # category detection (the semantic check is purely string-based and
+        # has no effect on the position/color/scale calculation above).
         label = " ".join(label_for_member(strain.members[0]).split())
+        shape = _shape_kind(rep, group, label=label)
+        scale = 0.35 + 1.65 * (strain.mass ** 0.5)
         spin = _stable_unit(rep.tobytes() + b"spin") * 6.28318
 
         objects.append(WorldObject(
@@ -396,6 +468,7 @@ class WorldCompiler:
             "seed": cfg.seed,
             "semantic_vocab": len(space.vocab),
             "semantic_dim": space.dim,
+            "semantic_pretrained_dim": space.pretrained_k,
         }
 
         fp = self._fingerprint(objects, edges, background)
@@ -481,9 +554,15 @@ def gate_diverges(text_a: str, text_b: str,
 # ---------------------------------------------------------------------------
 
 
-def render_html(scene: WorldScene, out_path: str) -> None:
-    from world_render import build_html
-    Path(out_path).write_text(build_html(scene.to_json_dict()), encoding="utf-8")
+def render_html(scene: WorldScene, out_path: str, threejs: bool = False) -> None:
+    """Write a self-contained HTML page for ``scene`` to ``out_path``.
+
+    ``threejs=True`` uses the WebGL/Three.js renderer (requires CDN on first
+    load; produces better visuals).  The default canvas renderer works fully
+    offline."""
+    from world_render import build_html, build_html_threejs
+    builder = build_html_threejs if threejs else build_html
+    Path(out_path).write_text(builder(scene.to_json_dict()), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -501,19 +580,26 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gates", action="store_true",
                         help="run determinism/divergence gates before rendering")
+    parser.add_argument("--threejs", action="store_true",
+                        help="use Three.js WebGL renderer (requires CDN; better visuals)")
+    parser.add_argument("--no-pretrained", action="store_true",
+                        help="disable pretrained semantic channel even if "
+                             "sentence-transformers is installed")
     args = parser.parse_args()
 
     text = Path(args.input).read_text(encoding="utf-8") if args.input else sys.stdin.read()
-    cfg = CompilerConfig(seed=args.seed)
+    cfg = CompilerConfig(seed=args.seed,
+                         pretrained_dim=0 if args.no_pretrained else 8)
 
     if args.gates:
         gate_determinism(text, cfg)
         print("GATE world-determinism   PASS")
 
     scene = WorldCompiler(cfg).compile(text)
-    render_html(scene, args.output)
+    render_html(scene, args.output, threejs=args.threejs)
+    renderer_tag = " (Three.js WebGL)" if args.threejs else ""
     print(f"compiled {scene.stats['chunks']} chunks -> {len(scene.objects)} motifs "
-         f"-> {args.output}")
+         f"-> {args.output}{renderer_tag}")
     print(f"  fingerprint: {scene.fingerprint}")
     print(f"  stats: {scene.stats}")
 
