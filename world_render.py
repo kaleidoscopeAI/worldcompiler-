@@ -1,25 +1,132 @@
 """world_render.py — render a WorldScene to a self-contained interactive HTML page.
 
-Pure client-side canvas 3D: no WebGL, no CDN, no external assets. Every
-object's position, facet count, color, and size were already decided
-deterministically by world_compiler.py from the compiled text; this module's
-only job is projecting that scene onto a screen.
+Two render paths are available:
 
-The projection is a straightforward pinhole camera. Faces are flat-shaded
-with a fixed light direction and depth-sorted (painter's algorithm) per
-frame — appropriate for a scene with a few dozen convex solids, not a
-general-purpose renderer.
+* ``build_html`` (default) — pure client-side canvas 3D, no WebGL, no CDN,
+  no external assets.  The projection is a straightforward pinhole camera;
+  faces are flat-shaded and depth-sorted (painter's algorithm) per frame.
+  Appropriate for a scene with a few dozen convex solids and guaranteed to
+  work offline.
+
+* ``build_html_threejs`` — opt-in WebGL path that loads Three.js from
+  jsDelivr CDN.  Uses real per-vertex normals, Phong shading, smooth
+  SphereGeometry and CylinderGeometry, and OrbitControls with damping.
+  Requires an internet connection the first time; select with
+  ``world_compiler.py --threejs``.
+
+Both paths consume the same ``WorldScene.to_json_dict()`` payload and
+display the same objects — same positions, shapes, colors, labels.
 """
 
 from __future__ import annotations
 
 import json
+import math
 
-# Convex, origin-centered platonic solids. Because they are convex and
-# centered at the origin, a face's outward normal direction is simply the
-# direction from the origin to that face's centroid — the renderer uses this
-# instead of a cross-product normal, which sidesteps winding-order bugs
-# entirely for this closed family of shapes.
+
+# ---------------------------------------------------------------------------
+# Procedural geometry builders (stdlib math only; called once at import time)
+# ---------------------------------------------------------------------------
+
+def _make_sphere() -> dict:
+    """Subdivide the icosahedron once to get a 42-vert, 80-face sphere
+    approximation.  All vertices are projected onto the unit sphere so the
+    centroid-as-normal trick the renderer uses is exact."""
+    t = 1.618033988749895
+    base = [
+        [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+        [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+        [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1],
+    ]
+    base_faces = [
+        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+    ]
+
+    def sph(v: list) -> list:
+        n = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+        return [c / n for c in v]
+
+    verts = [sph(v) for v in base]
+    cache: dict = {}
+
+    def mid(i: int, j: int) -> int:
+        key = (min(i, j), max(i, j))
+        if key in cache:
+            return cache[key]
+        m = [(verts[i][k] + verts[j][k]) / 2 for k in range(3)]
+        idx = len(verts)
+        verts.append(sph(m))
+        cache[key] = idx
+        return idx
+
+    faces = []
+    for f in base_faces:
+        a, b, c = f
+        ab, bc, ca = mid(a, b), mid(b, c), mid(c, a)
+        faces += [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]
+    return {"verts": verts, "faces": faces}
+
+
+def _make_cylinder(sides: int = 8) -> dict:
+    """8-sided prism: two rings + two cap centers = 18 verts, 24 faces."""
+    verts: list = []
+    for i in range(sides):
+        a = 2 * math.pi * i / sides
+        verts.append([math.cos(a), -1.0, math.sin(a)])   # bottom ring
+    for i in range(sides):
+        a = 2 * math.pi * i / sides
+        verts.append([math.cos(a), 1.0, math.sin(a)])    # top ring
+    bc, tc = 2 * sides, 2 * sides + 1
+    verts.append([0.0, -1.0, 0.0])                        # bottom centre
+    verts.append([0.0, 1.0, 0.0])                         # top centre
+
+    s = sides
+    faces = []
+    for i in range(s):
+        j = (i + 1) % s
+        faces.append([i, j, j + s, i + s])   # side quad
+    for i in range(s):
+        j = (i + 1) % s
+        faces.append([bc, j, i])              # bottom cap
+    for i in range(s):
+        j = (i + 1) % s
+        faces.append([tc, i + s, j + s])      # top cap
+    return {"verts": verts, "faces": faces}
+
+
+def _make_cone(sides: int = 8) -> dict:
+    """8-sided cone: base ring + apex + base centre = 10 verts, 16 faces."""
+    verts: list = []
+    for i in range(sides):
+        a = 2 * math.pi * i / sides
+        verts.append([math.cos(a), -1.0, math.sin(a)])
+    verts.append([0.0, 1.0, 0.0])   # apex
+    verts.append([0.0, -1.0, 0.0])  # base centre
+    apex, bc = sides, sides + 1
+
+    s = sides
+    faces = []
+    for i in range(s):
+        j = (i + 1) % s
+        faces.append([i, j, apex])   # side triangle
+    for i in range(s):
+        j = (i + 1) % s
+        faces.append([bc, j, i])     # base cap triangle
+    return {"verts": verts, "faces": faces}
+
+
+# ---------------------------------------------------------------------------
+# Geometry registry — canvas renderer looks shapes up here by name
+# ---------------------------------------------------------------------------
+
+# Convex, origin-centred solids.  For the platonic shapes the outward normal
+# equals the direction from the origin to the face centroid (centroid-normal
+# trick), which is what the canvas renderer uses.  The procedural shapes
+# (sphere, cylinder, cone) approximate this — shading is slightly imperfect
+# on caps but visually fine at the scale these objects appear.
 _POLYHEDRA = {
     "tetra": {
         "verts": [
@@ -59,6 +166,13 @@ _POLYHEDRA = {
             [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
         ],
     },
+    # --- Semantically-assigned shapes (new) ---------------------------------
+    # sphere  → persons / agents / living things
+    # cylinder → processes / flows / sequences
+    # cone    → actions / events / directional change
+    "sphere":   _make_sphere(),
+    "cylinder": _make_cylinder(),
+    "cone":     _make_cone(),
 }
 
 
@@ -715,6 +829,225 @@ async function submitFeed() {{
 feedBtn.addEventListener('click', submitFeed);
 feedInput.addEventListener('keydown', e => {{
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitFeed();
+}});
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Three.js WebGL renderer  (opt-in; requires CDN on first load)
+# ---------------------------------------------------------------------------
+
+def build_html_threejs(scene_dict: dict) -> str:
+    """WebGL render path using Three.js (loaded from jsDelivr CDN).
+    Produces real per-vertex normals, Phong shading, smooth sphere/cylinder/
+    cone geometry, and OrbitControls with damping.  Requires an internet
+    connection; use ``build_html`` for fully offline output.
+
+    The SCENE payload format is identical to the canvas path so both renderers
+    are drop-in replacements for each other."""
+    scene_json = json.dumps(scene_dict, separators=(",", ":"))
+    title_str = scene_dict.get("title", "untitled")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World Compiler (WebGL) \u2014 {title_str}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ width: 100%; height: 100%; overflow: hidden; background: #05060a; }}
+  body {{ font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }}
+  #c {{ position: fixed; inset: 0; }}
+
+  .hud {{ position: fixed; inset: 0; pointer-events: none; color: #e8e6f0; }}
+  .panel {{
+    position: absolute; pointer-events: auto;
+    background: rgba(10,10,18,0.62); border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 10px; backdrop-filter: blur(6px); padding: 12px 14px;
+  }}
+  .title-panel {{ top: 16px; left: 16px; max-width: min(46vw, 520px); }}
+  .title-panel h1 {{
+    font-family: Georgia, "Times New Roman", serif; font-weight: 400;
+    font-style: italic; font-size: 16px; line-height: 1.4; color: #fff; margin-bottom: 6px;
+  }}
+  .title-panel .sub {{ font-size: 10px; letter-spacing: 0.06em; color: #9a97ad; text-transform: uppercase; }}
+
+  .stats-panel {{ top: 16px; right: 16px; font-size: 10.5px; color: #b9b6c9; min-width: 190px; font-variant-numeric: tabular-nums; }}
+  .stats-panel .row {{ display: flex; justify-content: space-between; gap: 14px; padding: 2px 0; }}
+  .stats-panel .row b {{ color: #e8e6f0; font-weight: 500; }}
+  .stats-panel .fp {{ margin-top: 6px; font-size: 9px; color: #6f6c80; word-break: break-all; }}
+
+  .label-panel {{
+    bottom: 16px; left: 16px; max-width: min(70vw, 560px);
+    font-size: 12px; line-height: 1.55; color: #d8d6e6; opacity: 0;
+    transform: translateY(6px); transition: opacity 0.25s ease, transform 0.25s ease;
+  }}
+  .label-panel.visible {{ opacity: 1; transform: translateY(0); }}
+  .label-panel .tag {{ font-size: 9px; letter-spacing: 0.08em; color: #8b88a0; text-transform: uppercase; margin-bottom: 5px; }}
+  .label-panel .swatch {{ display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }}
+  @media (prefers-reduced-motion: reduce) {{ .label-panel {{ transition: none; }} }}
+
+  .hint {{
+    position: absolute; bottom: 16px; right: 16px;
+    font-size: 9.5px; letter-spacing: 0.04em; color: #6f6c80; text-transform: uppercase;
+  }}
+</style>
+</head>
+<body>
+<div id="c"></div>
+<div class="hud">
+  <div class="panel title-panel">
+    <h1 id="titleText"></h1>
+    <div class="sub">World Compiler &middot; WebGL &middot; text compiled to a symmetry-evolved 3D world</div>
+  </div>
+  <div class="panel stats-panel" id="statsPanel"></div>
+  <div class="panel label-panel" id="labelPanel">
+    <div class="tag">motif</div>
+    <div id="labelText"></div>
+  </div>
+  <div class="hint">drag to orbit &middot; scroll to zoom &middot; click a shape</div>
+</div>
+<script type="importmap">
+{{"imports":{{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
+
+const SCENE = {scene_json};
+
+// -- renderer + scene -------------------------------------------------------
+const container = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const bg = SCENE.background;
+scene.background = new THREE.Color(bg[0], bg[1], bg[2]);
+scene.fog = new THREE.FogExp2(new THREE.Color(bg[0] * 0.6, bg[1] * 0.6, bg[2] * 0.6), 0.035);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 2, 13);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.5;
+controls.addEventListener('start', () => {{ controls.autoRotate = false; }});
+
+// -- lighting ---------------------------------------------------------------
+scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+sun.position.set(5, 10, 7);
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x8888ff, 0.35);
+fill.position.set(-5, -3, -7);
+scene.add(fill);
+
+// -- geometry factory -------------------------------------------------------
+const GEO = {{
+  tetra:    () => new THREE.TetrahedronGeometry(1),
+  cube:     () => new THREE.BoxGeometry(1.4, 1.4, 1.4),
+  octa:     () => new THREE.OctahedronGeometry(1),
+  icosa:    () => new THREE.IcosahedronGeometry(1, 1),
+  sphere:   () => new THREE.SphereGeometry(1, 20, 14),
+  cylinder: () => new THREE.CylinderGeometry(0.65, 0.65, 1.8, 12),
+  cone:     () => new THREE.ConeGeometry(0.85, 2.0, 12),
+}};
+
+// -- build objects ----------------------------------------------------------
+const meshes = [];
+SCENE.objects.forEach(o => {{
+  const geoFn = GEO[o.shape] || GEO.icosa;
+  const col = new THREE.Color(o.color[0], o.color[1], o.color[2]);
+  const mat = new THREE.MeshPhongMaterial({{
+    color: col, shininess: 55,
+    specular: new THREE.Color(0.28, 0.28, 0.38),
+    emissive: col, emissiveIntensity: 0.07,
+  }});
+  const mesh = new THREE.Mesh(geoFn(), mat);
+  mesh.position.set(...o.pos);
+  mesh.scale.setScalar(o.scale);
+  mesh.userData = o;
+  scene.add(mesh);
+  meshes.push(mesh);
+}});
+
+// -- build edges ------------------------------------------------------------
+SCENE.edges.forEach(e => {{
+  const a = SCENE.objects[e.a], b = SCENE.objects[e.b];
+  const geo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(...a.pos), new THREE.Vector3(...b.pos),
+  ]);
+  scene.add(new THREE.Line(geo, new THREE.LineBasicMaterial({{
+    color: 0xaabbff, transparent: true, opacity: 0.05 + 0.18 * e.s,
+  }})));
+}});
+
+// -- HUD text ---------------------------------------------------------------
+document.getElementById('titleText').textContent = '"' + SCENE.title + '\u2026"';
+const s = SCENE.stats;
+document.getElementById('statsPanel').innerHTML = `
+  <div class="row"><span>source chars</span><b>${{s.source_chars}}</b></div>
+  <div class="row"><span>chunks</span><b>${{s.chunks}}</b></div>
+  <div class="row"><span>manifold rank</span><b>${{s.manifold_rank}}</b></div>
+  <div class="row"><span>symmetry |G|</span><b>${{s.group_order}}</b></div>
+  <div class="row"><span>generations</span><b>${{s.generations}}</b></div>
+  <div class="row"><span>survivors</span><b>${{s.survivors}}</b></div>
+  <div class="row"><span>motifs</span><b>${{s.motifs}}</b></div>
+  <div class="row"><span>refine passes</span><b>${{s.refine_passes}} (${{s.refine_converged ? 'converged' : 'max'}})</b></div>
+  <div class="fp">fp ${{SCENE.fingerprint}}</div>
+`;
+
+// -- animate ----------------------------------------------------------------
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let spinAngles = SCENE.objects.map(o => o.spin || 0);
+const clock = new THREE.Clock();
+(function frame() {{
+  requestAnimationFrame(frame);
+  const dt = REDUCED ? 0 : clock.getDelta();
+  meshes.forEach((m, i) => {{
+    spinAngles[i] += dt * 0.15;
+    m.rotation.y = spinAngles[i];
+  }});
+  controls.update();
+  renderer.render(scene, camera);
+}})();
+
+// -- resize -----------------------------------------------------------------
+window.addEventListener('resize', () => {{
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}});
+
+// -- click to inspect -------------------------------------------------------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const labelPanel = document.getElementById('labelPanel');
+const labelText = document.getElementById('labelText');
+let downX = 0, downY = 0;
+renderer.domElement.addEventListener('pointerdown', e => {{ downX = e.clientX; downY = e.clientY; }});
+renderer.domElement.addEventListener('pointerup', e => {{
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
+  pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(meshes);
+  if (!hits.length) {{ labelPanel.classList.remove('visible'); return; }}
+  const o = hits[0].object.userData;
+  const col = o.color.map(v => Math.round(v * 255));
+  labelText.innerHTML =
+    `<span class="swatch" style="background:rgb(${{col.join(',')}})"></span>` +
+    `<b>${{o.id}}</b> &middot; ${{o.shape}} &middot; mass ${{(o.mass * 100).toFixed(1)}}% &middot; ${{o.members}} members` +
+    `<br><span style="color:#a8a5ba">&ldquo;${{o.label}}&rdquo;</span>`;
+  labelPanel.classList.add('visible');
 }});
 </script>
 </body>

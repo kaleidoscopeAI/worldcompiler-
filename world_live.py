@@ -40,6 +40,7 @@ import kaleidoscope_group as kgroup
 import genetic_manifold as gmod
 import refinement_loop as refine
 import semantic_embedding as sem
+import gcode_embedding as gcode
 
 import world_compiler as wc
 
@@ -69,6 +70,7 @@ class LiveWorld:
         self.feed_log: List[FeedEvent] = []
         self._feed_epoch = 0
         self.semantic: Optional[sem.SemanticSpace] = None
+        self.gcode_space: Optional[gcode.GcodeSpace] = None
 
     @property
     def seeded(self) -> bool:
@@ -84,9 +86,10 @@ class LiveWorld:
                 raise wc.WorldCompilerError("world already seeded; start a new one to reseed")
             cfg = self.cfg
             text = text.strip()
-            window, stride, snippets, data, space = wc._ingest(text, cfg)
+            window, stride, snippets, data, space, gcode_sp = wc._ingest(text, cfg)
             n = len(snippets)
             self.semantic = space
+            self.gcode_space = gcode_sp
 
             gcfg = gmod.GeneticConfig(
                 seed=cfg.seed, generations=0, mutation_scale=cfg.mutation_scale,
@@ -118,7 +121,8 @@ class LiveWorld:
             # Reuse the founding SemanticSpace (never refit) — a feed is seen
             # through the vocabulary the world already learned, exactly like
             # it's seen through the founding geometric manifold below.
-            window, stride, snippets, data, _space = wc._ingest(text, cfg, semantic=self.semantic)
+            window, stride, snippets, data, _space, _ = wc._ingest(
+                text, cfg, semantic=self.semantic, gcode_space=self.gcode_space)
             n = len(snippets)
 
             codes = self.gm.manifold.encode(data)
@@ -135,6 +139,57 @@ class LiveWorld:
             self.total_fed_chars += len(text)
             self.feed_log.append(FeedEvent(t=time.time(), chars=len(text), chunks=n,
                                            tick_at_feed=self.tick_count))
+            del self.feed_log[:-20]
+            return n
+
+    def feed_gcode(self, gcode_text: str) -> int:
+        """Inject a G-code toolpath into the running population.
+
+        The G-code text is embedded through BOTH channels:
+          • text channel: trigram + semantic features of the G-code tokens,
+            seen through the founding semantic worldview.
+          • geometry channel: point-cloud features extracted from the parsed
+            3-D waypoints, normalised through the founding GcodeSpace.
+
+        Raises ``WorldCompilerError`` if the world was not founded with a
+        geometry channel (``cfg.gcode_dim == 0``).  Returns the number of
+        chunks added.
+        """
+        with self.lock:
+            if self.gm is None or self.gm.manifold is None:
+                raise wc.WorldCompilerError("seed the world before feeding it")
+            if self.cfg.gcode_dim <= 0 or self.gcode_space is None:
+                raise wc.WorldCompilerError(
+                    "world was not founded with a geometry channel "
+                    "(set cfg.gcode_dim > 0 when seeding)")
+            cfg = self.cfg
+            gcode_text = gcode_text.strip()
+            # Embed through both the founding semantic space and the founding
+            # GcodeSpace — _ingest will detect G-code commands and compute
+            # geometry features using the existing GcodeSpace normaliser.
+            window, stride, snippets, data, _space, _ = wc._ingest(
+                gcode_text, cfg,
+                semantic=self.semantic,
+                gcode_space=self.gcode_space)
+            n = len(snippets)
+
+            codes = self.gm.manifold.encode(data)
+            self._feed_epoch += 1
+            seed_energy = self.gm.cfg.seed_energy
+            for i in range(n):
+                origin = wc._origin_hash(data[i])
+                self.origin_labels[origin] = f"[gcode] {' '.join(snippets[i].split())[:60]}"
+                genome = gmod.CodeGenome(
+                    code=codes[i].copy(), generation=0, origin_hash=origin)
+                node_id = f"gcode{self._feed_epoch}-{i}"
+                self.gm.nodes[node_id] = gmod.GeneticNode(
+                    node_id, genome, energy=seed_energy)
+
+            self.total_fed_energy += n * seed_energy
+            self.total_fed_chars += len(gcode_text)
+            self.feed_log.append(FeedEvent(
+                t=time.time(), chars=len(gcode_text), chunks=n,
+                tick_at_feed=self.tick_count))
             del self.feed_log[:-20]
             return n
 

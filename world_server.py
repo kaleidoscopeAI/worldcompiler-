@@ -95,6 +95,16 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(422, {"error": str(e)})
                 return
             self._send(200, {"chunks_added": n, **self.world.scene().to_json_dict()})
+        elif self.path == "/gcode":
+            if not text:
+                self._send(400, {"error": "text required"})
+                return
+            try:
+                n = self.world.feed_gcode(text)
+            except wc.WorldCompilerError as e:
+                self._send(422, {"error": str(e)})
+                return
+            self._send(200, {"chunks_added": n, **self.world.scene().to_json_dict()})
         else:
             self._send(404, {"error": "not found"})
 
@@ -108,9 +118,10 @@ def serve(world: wl.LiveWorld, host: str = "127.0.0.1", port: int = 8420,
     heartbeat.start()
     httpd = ThreadingHTTPServer((host, port), handler)
     print(f"World Compiler — live server at http://{host}:{port}")
-    print("  POST /seed {text}   found the world (once)")
-    print("  POST /feed {text}   feed more text into the running population")
-    print("  GET  /state         current scene JSON")
+    print("  POST /seed  {text}   found the world (once)")
+    print("  POST /feed  {text}   feed more text into the running population")
+    print("  POST /gcode {text}   inject G-code toolpath (geometry + text channel)")
+    print("  GET  /state          current scene JSON")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
