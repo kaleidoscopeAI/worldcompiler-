@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>World Compiler — Globe Viewer</title>
+
+  <!-- CesiumJS from CDN (Apache 2.0, free rendering library) -->
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.118/Build/Cesium/Cesium.js"></script>
+  <link rel="stylesheet"
+        href="https://cesium.com/downloads/cesiumjs/releases/1.118/Build/Cesium/Widgets/widgets.css" />
+
+  <style>
+    /* Reset */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a14; font-family: sans-serif; }
+
+    /* Globe fills viewport */
+    #cesiumContainer { position: absolute; inset: 0; }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────────── */
+    #sidebar {
+      position: absolute;
+      top: 0; left: 0;
+      width: 280px;
+      height: 100%;
+      background: rgba(10, 12, 24, 0.88);
+      color: #ccd;
+      display: flex;
+      flex-direction: column;
+      z-index: 10;
+      border-right: 1px solid rgba(100, 130, 200, 0.25);
+      backdrop-filter: blur(4px);
+    }
+
+    #sidebar header {
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid rgba(100, 130, 200, 0.2);
+    }
+    #sidebar header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      color: #8af;
+      letter-spacing: 0.02em;
+    }
+    #sceneTitle {
+      font-size: 13px;
+      color: #dde;
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #sceneStats {
+      font-size: 10px;
+      color: #778;
+      margin-top: 2px;
+    }
+
+    #sidebarContent {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 0;
+    }
+    #entityList {
+      list-style: none;
+    }
+    .entity-item {
+      display: flex;
+      align-items: center;
+      padding: 5px 14px;
+      cursor: pointer;
+      font-size: 11px;
+      color: #aab;
+      gap: 8px;
+      transition: background 0.15s;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .entity-item:hover { background: rgba(80, 120, 200, 0.18); color: #ddf; }
+    .entity-swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* ── Info panel ──────────────────────────────────────────────────────── */
+    #infoPanel {
+      display: none;
+      position: absolute;
+      bottom: 32px;
+      right: 16px;
+      width: 300px;
+      background: rgba(10, 12, 24, 0.92);
+      color: #ccd;
+      border: 1px solid rgba(100, 130, 200, 0.3);
+      border-radius: 6px;
+      padding: 14px 16px;
+      z-index: 20;
+      font-size: 12px;
+      line-height: 1.6;
+      backdrop-filter: blur(6px);
+    }
+    #infoPanel h3 {
+      font-size: 13px;
+      color: #8af;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    #infoPanelClose {
+      cursor: pointer;
+      font-size: 16px;
+      color: #556;
+      line-height: 1;
+      background: none;
+      border: none;
+    }
+    #infoPanelClose:hover { color: #99c; }
+    .info-row { display: flex; gap: 8px; margin-bottom: 2px; }
+    .info-key { color: #778; min-width: 60px; }
+    .info-val { color: #dde; word-break: break-word; }
+    #infoLabel { font-style: italic; color: #99b; margin-top: 6px; font-size: 11px; }
+
+    /* ── Attribution ────────────────────────────────────────────────────── */
+    #attribution {
+      position: absolute;
+      bottom: 4px;
+      left: 284px;
+      font-size: 10px;
+      color: rgba(180, 190, 220, 0.6);
+      z-index: 5;
+    }
+    #attribution a { color: inherit; }
+
+    /* Hide Cesium default credit container overlap */
+    .cesium-credit-container { left: 284px !important; }
+  </style>
+</head>
+<body>
+
+  <!-- Globe -->
+  <div id="cesiumContainer"></div>
+
+  <!-- Sidebar -->
+  <aside id="sidebar">
+    <header>
+      <h1>🌐 World Compiler</h1>
+      <div id="sceneTitle">Loading…</div>
+      <div id="sceneStats"></div>
+    </header>
+    <div id="sidebarContent">
+      <ul id="entityList"></ul>
+    </div>
+  </aside>
+
+  <!-- Entity info panel -->
+  <div id="infoPanel">
+    <h3>
+      Entity info
+      <button id="infoPanelClose" title="Close">✕</button>
+    </h3>
+    <div class="info-row"><span class="info-key">ID</span>    <span class="info-val" id="infoId">—</span></div>
+    <div class="info-row"><span class="info-key">Type</span>  <span class="info-val" id="infoType">—</span></div>
+    <div class="info-row"><span class="info-key">Shape</span> <span class="info-val" id="infoShape">—</span></div>
+    <div class="info-row"><span class="info-key">Mass</span>  <span class="info-val" id="infoMass">—</span></div>
+    <div class="info-row"><span class="info-key">Coords</span><span class="info-val" id="infoPos">—</span></div>
+    <div id="infoLabel"></div>
+  </div>
+
+  <!-- Optional attribution -->
+  <div id="attribution">
+    Imagery © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors
+  </div>
+
+  <!-- Configuration (edit viewer/config.js to set ion token etc.) -->
+  <script src="config.js"></script>
+  <!-- Application logic -->
+  <script src="app.js"></script>
+
+</body>
+</html>
