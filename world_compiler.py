@@ -71,6 +71,7 @@ import kaleidoscope_group as kgroup
 import genetic_manifold as gmod
 import refinement_loop as refine
 import semantic_embedding as sem
+import gcode_embedding as gcode
 
 # Ordered by facet count. A supernode's shape family is a deterministic
 # function of how many latent axes its kaleidoscope invariant actually uses —
@@ -198,6 +199,15 @@ class CompilerConfig:
     # pretrained channel — requires sentence-transformers; falls back silently
     # when the package is absent.  Set to 0 to disable.
     pretrained_dim: int = 8
+    # geometry (G-code point-cloud) channel — set gcode_dim > 0 to enable.
+    # When enabled, the input text is also parsed as G-code: each text window
+    # gets a fixed-width geometry feature vector built from the 3-D waypoints
+    # that fall in that window.  Pure-text windows (no G-code commands) receive
+    # the zero vector, so the channel degrades gracefully on mixed content.
+    # gcode_weight scales the geometry block relative to the trigram channel,
+    # mirroring the role of semantic_weight for the semantic channel.
+    gcode_dim: int = 0         # geometry channel width (0 = disabled)
+    gcode_weight: float = 1.0  # relative influence vs the trigram channel
 
 
 # ---------------------------------------------------------------------------
@@ -248,18 +258,33 @@ def _auto_window(text_len: int, cfg: CompilerConfig) -> Tuple[int, int]:
 
 
 def _ingest(text: str, cfg: CompilerConfig,
-           semantic: Optional[sem.SemanticSpace] = None
-           ) -> Tuple[int, int, List[str], np.ndarray, sem.SemanticSpace]:
-    """Chunk text and embed each chunk as [orthographic trigram features |
-    semantic co-occurrence features] (see semantic_embedding.py for why both:
-    trigrams see spelling and survive OOV/typos with zero vocabulary;
-    co-occurrence sees topic and requires enough text to learn one).
+           semantic: Optional[sem.SemanticSpace] = None,
+           gcode_space: Optional[gcode.GcodeSpace] = None
+           ) -> Tuple[int, int, List[str], np.ndarray,
+                      sem.SemanticSpace, Optional[gcode.GcodeSpace]]:
+    """Chunk text and embed each chunk as:
 
-    If `semantic` is passed in already fit, chunks are embedded through it
-    unchanged rather than fitting a new one — this is how LiveWorld.feed()
-    keeps a running world in the same semantic coordinate system its founding
-    text established, exactly as it reuses the founding geometric manifold.
-    Returns (window, stride, snippets, data, semantic_space_used).
+      [orthographic trigram features | semantic co-occurrence features
+       | geometry (G-code point-cloud) features]
+
+    The trigram and semantic channels are unchanged from the pre-geometry
+    implementation.  The geometry channel is appended when ``cfg.gcode_dim
+    > 0``:
+
+    *Founding pass* (``gcode_space=None``): the full text is also parsed as
+    G-code; waypoints are collected per window and a fresh ``GcodeSpace``
+    is fitted from those statistics.  Pure-text windows (no G-code commands
+    anywhere in the document) all get the zero vector, which is the correct
+    honest answer: 'no geometry to report'.
+
+    *Feed/reuse pass* (``gcode_space`` supplied): if the input text contains
+    G-code motion commands, waypoints are extracted and encoded through the
+    SAME founding GcodeSpace (the world's geometry worldview is fixed at
+    founding, just like its semantic worldview).  Otherwise the geometry
+    block is zero-padded — regular text injected into a G-code-founded world
+    carries no geometric information.
+
+    Returns ``(window, stride, snippets, data, semantic_space, gcode_space)``.
     """
     window, stride = _auto_window(len(text), cfg)
     if len(text) < window + stride:
@@ -273,18 +298,43 @@ def _ingest(text: str, cfg: CompilerConfig,
     trigram = np.stack([src.observe(t) for t in range(n)])
 
     if cfg.semantic_dim <= 0:
-        return window, stride, snippets, trigram, sem.SemanticSpace.empty()
-
-    space = semantic if semantic is not None else sem.SemanticSpace.fit(
-        text, dim=cfg.semantic_dim, min_count=cfg.semantic_min_count,
-        max_vocab=cfg.semantic_max_vocab,
-        pretrained_dim=cfg.pretrained_dim)
-    if space.total_dim > 0:
-        sem_frames = np.stack([space.vector_for(s) for s in snippets]) * cfg.semantic_weight
-        data = np.concatenate([trigram, sem_frames], axis=1)
+        data = trigram
+        space = sem.SemanticSpace.empty()
     else:
-        data = trigram  # too little text to learn a semantic space; degrade gracefully
-    return window, stride, snippets, data, space
+        space = semantic if semantic is not None else sem.SemanticSpace.fit(
+            text, dim=cfg.semantic_dim, min_count=cfg.semantic_min_count,
+            max_vocab=cfg.semantic_max_vocab,
+            pretrained_dim=cfg.pretrained_dim)
+        if space.total_dim > 0:
+            sem_frames = (np.stack([space.vector_for(s) for s in snippets])
+                          * cfg.semantic_weight)
+            data = np.concatenate([trigram, sem_frames], axis=1)
+        else:
+            data = trigram
+
+    # --- geometry channel (G-code point-cloud) ----------------------------
+    if cfg.gcode_dim > 0:
+        if gcode.has_gcode(text):
+            # Parse waypoints once for the full text, then assign per window
+            all_wps = gcode.parse_gcode(text)
+            win_pts = [
+                gcode._window_points(all_wps, starts[i], starts[i] + window)
+                for i in range(n)
+            ]
+            if gcode_space is None:
+                # Founding: fit normalisation from this document
+                gcode_space = gcode.GcodeSpace.fit(win_pts, cfg.gcode_dim)
+            geom_frames = np.stack(
+                [gcode_space.vector_for(pts, af) for pts, af in win_pts]
+            ) * cfg.gcode_weight
+        else:
+            # No G-code in this text — zero-pad the geometry block
+            if gcode_space is None:
+                gcode_space = gcode.GcodeSpace.fit([], cfg.gcode_dim)
+            geom_frames = np.zeros((n, cfg.gcode_dim))
+        data = np.concatenate([data, geom_frames], axis=1)
+
+    return window, stride, snippets, data, space, gcode_space
 
 
 def _semantic_shape_category(label: str) -> Optional[str]:
@@ -405,7 +455,7 @@ class WorldCompiler:
     def compile(self, text: str) -> WorldScene:
         cfg = self.cfg
         text = text.strip()
-        window, stride, snippets, data, space = _ingest(text, cfg)
+        window, stride, snippets, data, space, gcode_sp = _ingest(text, cfg)
         n = len(snippets)
         origin_to_chunk = {_origin_hash(data[i]): i for i in range(n)}
 
@@ -469,6 +519,7 @@ class WorldCompiler:
             "semantic_vocab": len(space.vocab),
             "semantic_dim": space.dim,
             "semantic_pretrained_dim": space.pretrained_k,
+            "gcode_dim": gcode_sp.dim if gcode_sp is not None else 0,
         }
 
         fp = self._fingerprint(objects, edges, background)
