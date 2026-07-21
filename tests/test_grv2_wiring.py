@@ -98,14 +98,21 @@ def test_allow_llm_false_never_calls_the_llm_tier(monkeypatch):
 
 
 def test_retrieval_reuses_llm_entry_for_a_near_duplicate_phrasing(monkeypatch):
-    """The dictionary-retrieval tier's actual job: once 'castle' has been
+    """The dictionary-retrieval tier's actual job: once 'zorblex' has been
     resolved via the LLM tier, a near-identical later phrasing of the same
-    word should be served from the dictionary, not cost a second LLM call."""
+    word should be served from the dictionary, not cost a second LLM call.
+    A fabricated word, not a real one like the earlier drafts of this test
+    used ("castle") -- once definition_compiler.py became a live tier,
+    'castle' legitimately composes real geometry from its own WordNet
+    definition (one hypernym hop to 'house') before ever reaching the LLM
+    tier this test means to exercise, so a real word can no longer be
+    trusted to reach here. A fabricated word has no WordNet synsets at
+    all, so it's guaranteed to fall through every free tier first."""
     monkeypatch.setattr(llm_gcode, "generate_gcode_via_llm",
                         lambda word, context="": wiring.gcode_default())
 
     bank = wiring.WiringBank(allow_llm=True)
-    first = bank.recall("castle")
+    first = bank.recall("zorblex")
     assert first.source == "llm"
 
     # Same exact subject token, different surrounding phrase -- must hit
@@ -113,7 +120,7 @@ def test_retrieval_reuses_llm_entry_for_a_near_duplicate_phrasing(monkeypatch):
     monkeypatch.setattr(llm_gcode, "generate_gcode_via_llm",
                         lambda word, context="": (_ for _ in ()).throw(
                             AssertionError("must not call the LLM again for the same subject")))
-    second = bank.recall("a small castle nearby")  # "castle" stays the longest token
+    second = bank.recall("a small zorblex nearby")  # "zorblex" stays the longest token
     np.testing.assert_array_equal(first.points, second.points)
 
 
@@ -173,19 +180,28 @@ def test_llm_tier_used_when_it_succeeds(monkeypatch):
     monkeypatch.setattr(llm_gcode, "generate_gcode_via_llm", _fake_llm)
 
     bank = wiring.WiringBank(allow_llm=True)
-    entry = bank.recall("a majestic castle on the horizon")
+    # "zorblex", not a real word ("castle" was tried here originally) --
+    # since definition_compiler.py became a live tier, real dictionary
+    # words can legitimately resolve for free before ever reaching the LLM
+    # tier this test means to exercise. See the near-duplicate-phrasing
+    # test above for the same reasoning.
+    entry = bank.recall("a majestic zorblex on the horizon")
     assert entry.source == "llm"
     assert entry.node_count > 0
     assert len(calls) == 1
     # cache hit: recalling the same phrase must not call the LLM again
-    bank.recall("a majestic castle on the horizon")
+    bank.recall("a majestic zorblex on the horizon")
     assert len(calls) == 1
 
 
 def test_llm_tier_falls_back_to_neural_when_llm_returns_none(monkeypatch):
     monkeypatch.setattr(llm_gcode, "generate_gcode_via_llm", lambda word, context="": None)
     bank = wiring.WiringBank(allow_llm=True)
-    entry = bank.recall("some phrase the llm tier cannot help with")
+    # Every content word here is fabricated (no WordNet synsets at all),
+    # so none can accidentally resolve via definition_compiler's tier
+    # before reaching the LLM/neural tiers this test exercises -- a real
+    # sentence risks a real word composing for free instead.
+    entry = bank.recall("zorblex quennorf tantivorous splegwhat")
     assert entry.source == "neural"
 
 

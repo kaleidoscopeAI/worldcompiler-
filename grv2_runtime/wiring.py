@@ -12,7 +12,7 @@ stays stable across every recurrence of that word in a session -- it is the
 anatomical skeleton of the concept, not something texture or motion is
 allowed to reshape.
 
-Five lookup tiers, tried in order, each strictly more general (and more
+Six lookup tiers, tried in order, each strictly more general (and more
 expensive) than the last:
 
   1. GCODE_LIBRARY  -- 16 hand-authored, hand-tuned words (bear/tree/river/
@@ -23,7 +23,19 @@ expensive) than the last:
      clothing, + synonyms of tier-1 words), exact closed-form CSG
      signed-distance shapes, verified this session (26/26 upstream tests
      pass once its two deps are installed).
-  3. dictionary retrieval -- wiring_store.WiringStore persists every entry
+  3. definition_compiler -- free, offline WordNet hypernym/meronym
+     composition (definition_compiler.compile_word): a word with no
+     hand-authored shape of its own ("eagle") reuses the nearest ancestor
+     that already has real geometry ("bird", one hypernym hop up) and
+     attaches resolvable parts near its surface, instead of falling all
+     the way through to a hash-seeded blob. Sense-1-only by design (see
+     compile_word's docstring for why trying sense 2 on a miss is a trap,
+     not a fallback) and a fixed-point compiler: once a word resolves, it
+     becomes a usable ancestor for the next one, so coverage grows every
+     round without growing the hand-built seed set. Silently returns None
+     on any WordNet/nltk problem, exactly like the LLM tier below -- a
+     pure bonus, never a requirement.
+  4. dictionary retrieval -- wiring_store.WiringStore persists every entry
      any tier ever produces (word -> crystallized point cloud), across
      process restarts. Before paying for an LLM call, check whether a
      near-duplicate of the word (semantic_embed.py: TF-IDF+SVD over char
@@ -35,7 +47,7 @@ expensive) than the last:
      LLM tier's cost is paid at most once per genuinely new concept ever,
      not a substitute for real semantic generalization -- that's still the
      LLM tier's job.
-  4. llm_gcode       -- anything still unmatched, if ANTHROPIC_API_KEY is
+  5. llm_gcode       -- anything still unmatched, if ANTHROPIC_API_KEY is
      set. Asks an LLM to hand-author G-code for the word, reusing this
      module's own parse_gcode/normalize_pts/voxelize/anneal_crystal
      pipeline on the result. The one tier that costs money and needs the
@@ -46,7 +58,7 @@ expensive) than the last:
      network/parse problem, so this tier is a pure bonus, never a
      requirement. Its result is persisted too, so this tier is paid for
      at most once per genuinely new concept, ever.
-  5. film_siren      -- the true last resort, and the only tier guaranteed
+  6. film_siren      -- the true last resort, and the only tier guaranteed
      to always succeed. A deterministic (hash-seeded, no training, no
      network) FiLM-SIREN-deformed primitive with a genuine eikonal-
      corrected SDF. This is what replaced the old behavior of every
@@ -67,6 +79,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from . import atlas_csg
+from . import definition_compiler
 from . import film_siren
 from . import llm_gcode
 from . import semantic_embed
@@ -621,6 +634,10 @@ class WiringBank:
             if parts is not None:
                 return self._cached(f"atlas:{t}", lambda p=parts, t=t: self._build_atlas(t, p))
 
+        compiled = self._try_definition_compiler(candidates)
+        if compiled is not None:
+            return compiled
+
         if not raw_key:
             return self._cached("default", lambda: self._build_gcode("default"))
 
@@ -696,6 +713,39 @@ class WiringBank:
         for e in self._entries.values():
             if e.word == word and e.source == "llm":
                 return e
+        return None
+
+    def _try_definition_compiler(self, candidates: List[str]) -> Optional["WiringEntry"]:
+        """Tier 3: definition_compiler.py's free, offline WordNet
+        hypernym/meronym composition -- tried after exact/fuzzy
+        GCODE_LIBRARY/atlas hits (a direct hand-authored shape always wins
+        over a composed one) and before retrieval/LLM/neural (a shape
+        composed from the word's own dictionary definition is more
+        meaningful than a char-n-gram similarity guess or a hash-seeded
+        blob). Looked up via definition_compiler._base_tier_entry rather
+        than assuming a "compiled:{word}" cache key exists after a
+        resolved trace: compile_word's own fast path returns resolved=True
+        by reusing whatever _base_tier_entry already finds (which also
+        matches prior LLM-sourced entries, not just its own "compiled:"
+        cache), so nothing new gets written in that case -- the entry
+        still needs to be fetched through the same helper compile_word
+        used internally. Silently returns None on any nltk/WordNet problem
+        (not installed, corpus not downloaded, lookup failure) -- same
+        pure-bonus discipline as the LLM tier."""
+        for t in candidates:
+            if len(t) < 3:
+                continue
+            existing = definition_compiler._base_tier_entry(self, t)
+            if existing is not None:
+                return existing
+            try:
+                trace = definition_compiler.compile_word(t, self)
+            except Exception:
+                continue
+            if trace is not None and trace.resolved:
+                resolved = definition_compiler._base_tier_entry(self, t)
+                if resolved is not None:
+                    return resolved
         return None
 
     def _try_retrieval(self, subject: str) -> Optional["WiringEntry"]:
