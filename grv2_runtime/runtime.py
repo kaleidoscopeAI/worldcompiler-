@@ -42,6 +42,7 @@ import world_live as wl                        # noqa: E402
 from . import curiosity as cur_mod             # noqa: E402
 from . import frame as frame_mod               # noqa: E402
 from . import mira as mira_mod                 # noqa: E402
+from . import narrator as narrator_mod         # noqa: E402
 from . import rase as rase_mod                 # noqa: E402
 from . import sgr as sgr_mod                   # noqa: E402
 from . import texture as texture_mod           # noqa: E402
@@ -307,24 +308,35 @@ class Runtime:
 
     def _build_narrative(self, action: str, turn: mira_mod.MIRATurnResult,
                          accepted: List[sgr_mod.Entity], terrain_delta: int) -> str:
-        lines = [f"SGR:0x{self.kernel.get_merkle_root()[:12]}  tick:{self.tick}  R:{turn.reward:.3f}"]
-        if turn.foe_mode_active:
-            lines[-1] += "  [FOE]"
+        """Prose, not telemetry. Every real signal this turn produced
+        (reward, foe mode, curiosity-accepted entities, terrain delta, NPC
+        state) is still fully available structurally on TurnResult/
+        state_dict() for any caller that wants the raw numbers -- this is
+        specifically the string a player reads, so it goes through
+        narrator.py rather than printing merkle roots and entity ids
+        directly (see narrator.py's docstring for why that was happening
+        at all: there is no LLM-based narrator anywhere in this repo, so
+        the raw internal format WAS the player-facing text before this)."""
+        lines = []
         if turn.disposition == mira_mod.ActionDisposition.COMPLIANT_DEFIANCE:
-            lines.append(f"[COMPLIANT DEFIANCE] {turn.co_author_comment}")
+            lines.append(turn.co_author_comment)
         elif turn.co_author_comment:
             lines.append(turn.co_author_comment)
-        if accepted:
-            lines.append("[Curiosity ¬S]")
-            for ent in accepted:
-                impl = ent.properties.get("implication", ent.type)
-                lines.append(f"  + {ent.id} [{impl}]")
-        if terrain_delta:
-            sign = "+" if terrain_delta >= 0 else ""
-            lines.append(f"The ground itself answers: {sign}{terrain_delta} deep chunks near you.")
+
+        curiosity_line = narrator_mod.describe_curiosity(accepted)
+        if curiosity_line:
+            lines.append(curiosity_line)
+
+        terrain_line = narrator_mod.describe_terrain(terrain_delta)
+        if terrain_line:
+            lines.append(terrain_line)
+
         npc = self.npc_registry.get("yeti_original")
         if npc is not None and self._npc_engaged(action):
-            lines.append(npc.assemble_context(action))
+            lines.append(narrator_mod.describe_npc(npc))
+
+        if not lines:
+            lines.append("The world settles, unremarkable, around your last move.")
         return "\n".join(lines)
 
     _NPC_MENTION_KEYWORDS = ("yeti", "creature", "beast")

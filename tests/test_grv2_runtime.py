@@ -9,6 +9,7 @@ test_grv2_geo_export.py.
 import pytest
 
 import grv2_runtime.texture as texture_mod
+from grv2_runtime import mira as mira_mod
 from grv2_runtime.mira import ActionDisposition
 from grv2_runtime.runtime import Runtime
 
@@ -93,11 +94,11 @@ def test_win_button_and_duality_collapse_detection_agree():
     player = rt.kernel.get_entity("player")
     assert player.properties.get("game_state") == "questioning"
     assert player.properties.get("duality_event") == "win_button_pressed"
-    assert "[COMPLIANT DEFIANCE]" in result.narrative
+    assert any(c in result.narrative for c in mira_mod._DEFIANCE_COMMENTS)
 
     rt2 = _new_runtime()
     result2 = rt2.step("just finish this")
     player2 = rt2.kernel.get_entity("player")
     assert player2.properties.get("game_state") == "questioning"
     assert player2.properties.get("duality_event") == "win_button_pressed"
-    assert "[COMPLIANT DEFIANCE]" in result2.narrative
+    assert any(c in result2.narrative for c in mira_mod._DEFIANCE_COMMENTS)
