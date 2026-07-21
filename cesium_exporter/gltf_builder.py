@@ -34,6 +34,7 @@ scaling.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import struct
@@ -413,9 +414,77 @@ def build_glb(entities: List[Dict[str, Any]]) -> bytes:
         east_m  = float(enu.get("east",  0.0))
         north_m = float(enu.get("north", 0.0))
         up_m    = float(enu.get("up",    0.0))
+        color   = ent.get("color", [0.7, 0.7, 0.7])
+
+        # ---- point-cloud path: real wiring (grv2_runtime.wiring.WiringEntry
+        # points), not a primitive shape. Points are already in real metres,
+        # already y-up -- only translated into the tile's local ENU frame,
+        # never rescaled the way a unit primitive would be. glTF mode 0 =
+        # POINTS needs no index buffer and no normals.
+        points_raw = ent.get("points")
+        if points_raw is not None:
+            pos = np.asarray(points_raw, dtype=np.float32).reshape(-1, 3).copy()
+            if len(pos) == 0:
+                continue
+            pos[:, 0] += east_m
+            pos[:, 1] += up_m
+            pos[:, 2] += -north_m
+
+            pos_bv = _add_bv(pos, _TARGET_ARRAY_BUFFER)
+            pos_acc = _add_accessor(pos_bv, _COMPONENT_FLOAT, len(pos), "VEC3",
+                                    min=pos.min(axis=0).tolist(), max=pos.max(axis=0).tolist())
+
+            # Per-vertex color, sampled from the entity's real k-means (or
+            # offline-hash) palette -- weighted toward the dominant tone,
+            # plus a little brightness jitter -- instead of painting every
+            # point the same flat color. A monochrome point cloud reads as
+            # a stencil, not a surface; real photos already carry more
+            # than one color, this is what stops that from being thrown
+            # away. Seeded from the entity's own id/label so re-exporting
+            # the same scene reproduces the same per-point colors rather
+            # than a new random look every run.
+            palette_raw = ent.get("palette") or [color]
+            pal = np.asarray(palette_raw, dtype=np.float32).reshape(-1, 3)
+            seed_src = str(ent.get("id") or ent.get("label") or "entity")
+            seed = int.from_bytes(hashlib.blake2b(seed_src.encode(), digest_size=4).digest(), "big")
+            rng = np.random.RandomState(seed)
+            weights = 1.0 / np.arange(1, len(pal) + 1)
+            weights /= weights.sum()
+            choice = rng.choice(len(pal), size=len(pos), p=weights)
+            vcolor = pal[choice].copy()
+            jitter = rng.uniform(-0.06, 0.06, size=vcolor.shape).astype(np.float32)
+            vcolor = np.clip(vcolor + jitter, 0.0, 1.0)
+            vcolor_rgba = np.concatenate(
+                [vcolor, np.ones((len(vcolor), 1), dtype=np.float32)], axis=1)
+
+            col_bv = _add_bv(vcolor_rgba, _TARGET_ARRAY_BUFFER)
+            col_acc = _add_accessor(col_bv, _COMPONENT_FLOAT, len(vcolor_rgba), "VEC4")
+
+            mat_idx = len(materials)
+            materials.append({
+                "pbrMetallicRoughness": {
+                    # Neutral -- COLOR_0 (per-vertex) carries the actual
+                    # tint now; glTF multiplies the two together.
+                    "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 1.0,
+                },
+                "doubleSided": True,
+            })
+
+            mesh_idx = len(meshes)
+            meshes.append({
+                "primitives": [{
+                    "attributes": {"POSITION": pos_acc, "COLOR_0": col_acc},
+                    "material": mat_idx,
+                    "mode": 0,   # POINTS
+                }]
+            })
+            nodes.append({"mesh": mesh_idx})
+            continue
+
         scale_h = float(ent.get("entity_height_m", 20.0))
         scale_w = float(ent.get("scale_m",         20.0))
-        color   = ent.get("color", [0.7, 0.7, 0.7])
         shape   = ent.get("shape", "cube")
 
         # Retrieve unit-scale geometry

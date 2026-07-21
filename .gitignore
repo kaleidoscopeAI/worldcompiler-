@@ -6,3 +6,9 @@ venv/
 env/
 build/
 dist/
+*.so
+
+# generated exports / logs -- regenerable, not source
+cesium_output/
+gcsn/data/*.pt*
+gcsn/train_log*.txt
